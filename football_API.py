@@ -240,13 +240,13 @@ def enviar_correo(destinatario: str, partidos_usuario: list) -> bool:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_USER, GMAIL_PASSWORD)
             server.sendmail(GMAIL_USER, destinatario, msg.as_string())
-        print(f"  ✅ Correo enviado a {destinatario}")
+        print(f"  [OK] Correo enviado a {destinatario}")
         return True
     except smtplib.SMTPAuthenticationError:
-        print("  ❌ Error de autenticación Gmail. Verifica GMAIL_USER y GMAIL_PASSWORD.")
+        print("  [ERROR] Autenticación Gmail fallida. Verifica GMAIL_USER y GMAIL_PASSWORD.")
         return False
     except Exception as e:
-        print(f"  ❌ Error enviando a {destinatario}: {e}")
+        print(f"  [ERROR] Error enviando a {destinatario}: {e}")
         return False
 
 
