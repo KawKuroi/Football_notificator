@@ -1,67 +1,44 @@
 # Football-API · Notificaciones Primera A Colombia
 
-Script en Python que envía un correo diario a cada suscriptor con los partidos del día de los equipos que sigue en la Primera A colombiana.
+Script en Python que cada día envía un correo a cada suscriptor con los partidos de Primera A en los que juegan los equipos que sigue.
 
-## Cómo funciona
+> **¿Quieres recibir las notificaciones?** [Regístrate aquí](https://docs.google.com/forms/d/e/1FAIpQLSfWAvjTkm4juDIfujPEEUeR5ZGn3RQ488YpwjKwv8vfjYEv7A/viewform?usp=sharing&ouid=116755060793765765939) (Google Form).
+>
+> **Base de datos de suscriptores:** [Google Sheet](https://docs.google.com/spreadsheets/d/18N-jBqoiurxsd66mVli83SiTWUY58IgYh8Ov70ff8l0/edit?usp=sharing) — alimentada automáticamente por el Form.
 
-1. Lee la **agenda de partidos** desde un Google Sheet público.
-2. Lee los **suscriptores** desde un Sheet poblado por un Google Form (correo + equipos seguidos).
-3. Filtra los partidos cuya fecha es hoy.
-4. Para cada suscriptor, busca coincidencias entre sus equipos y los partidos del día.
-5. Envía un correo HTML por SMTP de Gmail solo a quienes tienen al menos un partido hoy.
+## Demo
 
-Los nombres de equipos se normalizan vía un diccionario `ALIAS` para tolerar variaciones de escritura del Form.
+| Suscripción (Google Form) | Correo recibido |
+|---|---|
+| ![Formulario](docs/screenshots/Form.PNG) | ![Correo](docs/screenshots/Resultado_equipos.PNG) |
 
 ## Requisitos
 
 - Python 3.12+
-- Cuenta Gmail con 2FA y una [contraseña de aplicación](https://myaccount.google.com/apppasswords)
-- Los dos Google Sheets compartidos como *"cualquiera con el enlace"*
+- Cuenta Gmail con 2FA y [contraseña de aplicación](https://myaccount.google.com/apppasswords)
 
-## Configuración
-
-```bash
-cp .env.example .env
-# editar .env con GMAIL_USER y GMAIL_PASSWORD
-```
-
-## Ejecución
-
-**Local:**
+## Uso local
 
 ```bash
+cp .env.example .env          # añadir GMAIL_USER y GMAIL_PASSWORD
 pip install -r requirements.txt
 python football_API.py
 ```
 
-**Docker:**
+## Docker
 
 ```bash
 docker build -t football-api .
 docker run --rm --env-file .env football-api
 ```
 
-El script es de una sola pasada: corre, envía los correos del día y termina. Pensado para ejecutarse una vez al día (cron, Cloud Run Job, etc.).
-
 ## Tests
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest
+pytest
 ```
 
-Toda la I/O (HTTP a Google Sheets, SMTP a Gmail) está mockeada — los tests no hacen llamadas reales.
+---
 
-## Estructura
-
-```
-.
-├── football_API.py        # script único, todo el pipeline está aquí
-├── tests/
-│   └── test_football_API.py
-├── requirements.txt        # deps de runtime
-├── requirements-dev.txt    # + pytest
-├── Dockerfile
-├── .env.example            # plantilla de variables (copiar a .env)
-└── CLAUDE.md               # notas de arquitectura para asistentes
-```
+Pensado para correr como **Cloud Run Job** disparado por **Cloud Scheduler** en Google Cloud, pero el contenedor es one-shot y corre igual de bien en local o en cualquier cron.

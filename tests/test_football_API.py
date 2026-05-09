@@ -1,3 +1,4 @@
+import json
 from datetime import date
 from unittest.mock import MagicMock
 
@@ -125,15 +126,28 @@ class TestGenerarHtml:
             "Equipo Visitante": "Atlético Nacional",
             "Hora": "20:00",
             "Estadio": "El Campín",
-            "Jornada": "12",
         }]
         html = fa.generar_html(partidos)
         assert "Millonarios" in html
         assert "Atlético Nacional" in html
         assert "20:00" in html
         assert "El Campín" in html
-        assert "08/05/2026" in html
+        assert "8 de mayo" in html
         assert "<table" in html
+
+    def test_diseno_minimalista(self, monkeypatch):
+        """Asserciones negativas: el rediseño no debe traer de vuelta lo viejo."""
+        monkeypatch.setattr(fa, "HOY", date(2026, 5, 8))
+        partidos = [{
+            "Equipo Local": "Millonarios",
+            "Equipo Visitante": "Atlético Nacional",
+            "Hora": "20:00",
+            "Estadio": "El Campín",
+        }]
+        html = fa.generar_html(partidos)
+        assert "⚽" not in html, "no emojis decorativos"
+        assert "Jornada" not in html and "J12" not in html, "columna Jornada eliminada"
+        assert "#1B5E20" not in html.upper(), "paleta verde forestal vieja eliminada"
 
 
 # ─────────────────────────────────────────────
@@ -230,9 +244,9 @@ class TestMain:
             {fa.COL_CORREO: "neutral@x.com", fa.COL_EQUIPOS: "Llaneros"},  # juega mañana
         ]
 
-        def fake_leer_sheet(sheet_id, sheet_name):
-            return partidos_data if sheet_id == fa.SHEET_PARTIDOS_ID else form_data
-        monkeypatch.setattr(fa, "leer_sheet", fake_leer_sheet)
+        monkeypatch.setattr(fa, "obtener_partidos", lambda: partidos_data)
+        monkeypatch.setattr(fa, "enriquecer_con_estadio", lambda p: None)
+        monkeypatch.setattr(fa, "leer_sheet", lambda sid, name: form_data)
 
         enviados = []
         monkeypatch.setattr(
@@ -264,12 +278,190 @@ class TestMain:
         ]
         form_data = [{fa.COL_CORREO: "fan@x.com", fa.COL_EQUIPOS: "Llaneros"}]
 
-        monkeypatch.setattr(
-            fa, "leer_sheet",
-            lambda sid, name: partidos_data if sid == fa.SHEET_PARTIDOS_ID else form_data,
-        )
+        monkeypatch.setattr(fa, "obtener_partidos", lambda: partidos_data)
+        monkeypatch.setattr(fa, "enriquecer_con_estadio", lambda p: None)
+        monkeypatch.setattr(fa, "leer_sheet", lambda sid, name: form_data)
         envio_spy = MagicMock()
         monkeypatch.setattr(fa, "enviar_correo", envio_spy)
 
         fa.main()
         envio_spy.assert_not_called()
+
+
+# ─────────────────────────────────────────────
+# obtener_partidos (mock de requests.get)
+# ─────────────────────────────────────────────
+class TestObtenerPartidos:
+    PAYLOAD = {
+        "props": {
+            "pageProps": {
+                "matches": [
+                    {
+                        "homeTeam": {"name": "Millonarios"},
+                        "awayTeam": {"name": "Independiente Santa Fe"},
+                        "kickoff":  "2026-05-09T01:00:00Z",
+                        "matchday": 12,
+                        "url":      "/es/partido/millonarios-vs-santa-fe-123",
+                    },
+                ]
+            }
+        }
+    }
+
+    def _html(self, payload: dict) -> str:
+        return (
+            "<html><body>"
+            '<script id="__NEXT_DATA__" type="application/json">'
+            f"{json.dumps(payload)}"
+            "</script></body></html>"
+        )
+
+    def test_extrae_partido_con_conversion_de_zona_horaria(self, monkeypatch):
+        fake = MagicMock()
+        fake.text = self._html(self.PAYLOAD)
+        fake.raise_for_status = MagicMock()
+        monkeypatch.setattr(fa.requests, "get", lambda *a, **kw: fake)
+
+        partidos = fa.obtener_partidos()
+        assert len(partidos) == 1
+        p = partidos[0]
+        assert p["Equipo Local"]     == "Millonarios"
+        assert p["Equipo Visitante"] == "Independiente Santa Fe"
+        # kickoff 2026-05-09T01:00Z = 2026-05-08T20:00 en Bogotá (UTC-5)
+        assert p["Fecha"] == "08/05/2026"
+        assert p["Hora"]  == "20:00"
+        assert p["Jornada"]  == "12"
+        assert p["Estadio"]  == "N/D"
+
+    def test_sin_next_data_devuelve_lista_vacia(self, monkeypatch):
+        fake = MagicMock()
+        fake.text = "<html><body>sin script</body></html>"
+        fake.raise_for_status = MagicMock()
+        monkeypatch.setattr(fa.requests, "get", lambda *a, **kw: fake)
+        assert fa.obtener_partidos() == []
+
+    def test_json_invalido_devuelve_lista_vacia(self, monkeypatch):
+        fake = MagicMock()
+        fake.text = '<script id="__NEXT_DATA__" type="application/json">{no es json}</script>'
+        fake.raise_for_status = MagicMock()
+        monkeypatch.setattr(fa.requests, "get", lambda *a, **kw: fake)
+        assert fa.obtener_partidos() == []
+
+    def test_error_de_red_devuelve_lista_vacia(self, monkeypatch):
+        def boom(*a, **kw):
+            raise requests.exceptions.ConnectionError("offline")
+        monkeypatch.setattr(fa.requests, "get", boom)
+        assert fa.obtener_partidos() == []
+
+    def test_jornada_ausente_usa_nd(self, monkeypatch):
+        payload = {"data": [
+            {"homeTeam": {"name": "A"}, "awayTeam": {"name": "B"},
+             "kickoff": "2026-05-08T23:00:00Z"}
+        ]}
+        fake = MagicMock()
+        fake.text = self._html(payload)
+        fake.raise_for_status = MagicMock()
+        monkeypatch.setattr(fa.requests, "get", lambda *a, **kw: fake)
+        p = fa.obtener_partidos()[0]
+        assert p["Jornada"] == "N/D"
+        assert p["Estadio"] == "N/D"
+
+    def test_link_se_usa_como_url_detalle(self, monkeypatch):
+        """onefootball real usa 'link' (no 'url') para la página de detalle."""
+        payload = {"data": [{
+            "homeTeam": {"name": "A"}, "awayTeam": {"name": "B"},
+            "kickoff":  "2026-05-08T23:00:00Z",
+            "link":     "/es/partido/2682109",
+        }]}
+        fake = MagicMock()
+        fake.text = self._html(payload)
+        fake.raise_for_status = MagicMock()
+        monkeypatch.setattr(fa.requests, "get", lambda *a, **kw: fake)
+        p = fa.obtener_partidos()[0]
+        assert p["_url_detalle"] == "/es/partido/2682109"
+
+
+# ─────────────────────────────────────────────
+# enriquecer_con_estadio (mock de requests.get)
+# ─────────────────────────────────────────────
+class TestEnriquecerConEstadio:
+    PAYLOAD_DETALLE = {
+        "props": {
+            "pageProps": {
+                "match": {"venue": {"name": "El Campín"}}
+            }
+        }
+    }
+
+    def _html(self, payload: dict) -> str:
+        return (
+            "<html><body>"
+            '<script id="__NEXT_DATA__" type="application/json">'
+            f"{json.dumps(payload)}"
+            "</script></body></html>"
+        )
+
+    def test_rellena_estadio_desde_pagina_de_detalle(self, monkeypatch):
+        fake = MagicMock()
+        fake.text = self._html(self.PAYLOAD_DETALLE)
+        fake.raise_for_status = MagicMock()
+        monkeypatch.setattr(fa.requests, "get", lambda *a, **kw: fake)
+
+        partidos = [{"Estadio": "N/D", "_url_detalle": "/es/partido/test-123"}]
+        fa.enriquecer_con_estadio(partidos)
+        assert partidos[0]["Estadio"] == "El Campín"
+        assert "_url_detalle" not in partidos[0]
+
+    def test_sin_url_no_hace_peticion(self, monkeypatch):
+        spy = MagicMock()
+        monkeypatch.setattr(fa.requests, "get", spy)
+
+        partidos = [{"Estadio": "N/D", "_url_detalle": ""}]
+        fa.enriquecer_con_estadio(partidos)
+        spy.assert_not_called()
+
+    def test_error_de_red_deja_estadio_en_nd(self, monkeypatch):
+        def boom(*a, **kw):
+            raise requests.exceptions.ConnectionError("offline")
+        monkeypatch.setattr(fa.requests, "get", boom)
+
+        partidos = [{"Estadio": "N/D", "_url_detalle": "/es/partido/x"}]
+        fa.enriquecer_con_estadio(partidos)
+        assert partidos[0]["Estadio"] == "N/D"
+
+    def test_busca_estadio_en_matchinfo_entries(self, monkeypatch):
+        """onefootball real expone el estadio como title='Estadio'/subtitle='<nombre>'."""
+        payload_real = {
+            "props": {"pageProps": {"containers": [{
+                "type": {"grid": {"items": [{"components": [{
+                    "contentType": {"matchInfo": {"entries": [
+                        {"title": "Competición", "subtitle": "Primera A"},
+                        {"title": "Estadio",     "subtitle": "Estadio Metropolitano de Techo"},
+                    ]}}
+                }]}]}}
+            }]}}
+        }
+        fake = MagicMock()
+        fake.text = self._html(payload_real)
+        fake.raise_for_status = MagicMock()
+        monkeypatch.setattr(fa.requests, "get", lambda *a, **kw: fake)
+
+        partidos = [{"Estadio": "N/D", "_url_detalle": "/es/partido/123"}]
+        fa.enriquecer_con_estadio(partidos)
+        assert partidos[0]["Estadio"] == "Estadio Metropolitano de Techo"
+
+    def test_url_relativa_se_completa_con_dominio(self, monkeypatch):
+        urls = []
+        fake = MagicMock()
+        fake.text = self._html(self.PAYLOAD_DETALLE)
+        fake.raise_for_status = MagicMock()
+
+        def fake_get(url, **kw):
+            urls.append(url)
+            return fake
+
+        monkeypatch.setattr(fa.requests, "get", fake_get)
+
+        partidos = [{"Estadio": "N/D", "_url_detalle": "/es/partido/test-123"}]
+        fa.enriquecer_con_estadio(partidos)
+        assert urls[0].startswith("https://onefootball.com")

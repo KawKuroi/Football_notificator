@@ -1,0 +1,4 @@
+{
+  "include": ["football_API.py", "tests"],
+  "extraPaths": ["."]
+}

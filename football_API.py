@@ -1,12 +1,16 @@
 import requests
 import csv
 import io
+import json
+import re
 import smtplib
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -18,9 +22,14 @@ load_dotenv()
 GMAIL_USER     = os.environ.get("GMAIL_USER")
 GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD")
 
-# Sheet de partidos (público)
-SHEET_PARTIDOS_ID   = "138zg3LcS8wQTpBJd_WhTPLOkGeMwj7aZ37MGJToc0Tw"
-SHEET_PARTIDOS_NAME = "Hoja1"
+# Fuente de partidos (scraping directo de onefootball.com)
+URL_ONEFOOTBALL = "https://onefootball.com/es/competicion/primera-a-109/partidos"
+ZONA_HORARIA    = "America/Bogota"
+USER_AGENT      = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 # Sheet de respuestas del Form (público)
 SHEET_FORM_ID   = "18N-jBqoiurxsd66mVli83SiTWUY58IgYh8Ov70ff8l0"
@@ -32,9 +41,16 @@ COL_EQUIPOS = "¿Sobre que equipos quieres recibir notificaciones?"
 
 HOY = datetime.now().date()
 
+# Nombres de meses en español (locale-independent — Cloud Run Linux puede no tener es_CO).
+MESES_ES = {
+    1: "enero",   2: "febrero", 3: "marzo",      4: "abril",
+    5: "mayo",    6: "junio",   7: "julio",      8: "agosto",
+    9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre",
+}
+
 # ─────────────────────────────────────────────
 # NORMALIZACIÓN DE NOMBRES DE EQUIPOS
-# Mapea variaciones del Form → nombre exacto en el Sheet de partidos
+# Mapea variaciones del Form → nombre exacto en onefootball
 # ─────────────────────────────────────────────
 ALIAS = {
     "llaneros":                  "llaneros fc",
@@ -84,6 +100,170 @@ def leer_sheet(sheet_id: str, sheet_name: str) -> list:
     contenido = r.content.decode("utf-8")
     reader    = csv.DictReader(io.StringIO(contenido))
     return list(reader)
+
+
+# ─────────────────────────────────────────────
+# SCRAPING DE PARTIDOS — onefootball.com
+# ─────────────────────────────────────────────
+def _extraer_next_data(html: str) -> dict | None:
+    """Extrae el payload JSON embebido en <script id="__NEXT_DATA__">."""
+    m = re.search(
+        r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    if not m:
+        print("❌ No se encontró __NEXT_DATA__ en la página de onefootball.")
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON inválido en __NEXT_DATA__: {e}")
+        return None
+
+
+def _buscar_lista_partidos(node):
+    """Busca recursivamente la primera lista de dicts que parezcan partidos."""
+    if isinstance(node, list):
+        if node and isinstance(node[0], dict) and (
+            "homeTeam" in node[0] or "kickoff" in node[0] or "scheduledAt" in node[0]
+        ):
+            return node
+        for item in node:
+            found = _buscar_lista_partidos(item)
+            if found:
+                return found
+    elif isinstance(node, dict):
+        for v in node.values():
+            found = _buscar_lista_partidos(v)
+            if found:
+                return found
+    return None
+
+
+def _buscar_venue(node) -> str | None:
+    """Busca recursivamente un nombre de estadio dentro de un payload JSON.
+
+    Soporta dos formatos vistos en onefootball:
+    1) Claves directas `venue`/`stadium` (con sub-clave `name` o string).
+    2) Pares title/subtitle dentro de `matchInfo.entries`, donde
+       `title in {"Estadio", "Stadium"}` y el nombre real está en `subtitle`.
+    """
+    if isinstance(node, dict):
+        for clave in ("venue", "stadium"):
+            v = node.get(clave)
+            if isinstance(v, dict) and v.get("name"):
+                return v["name"].strip()
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        titulo = node.get("title")
+        if isinstance(titulo, str) and titulo.strip().lower() in ("estadio", "stadium"):
+            sub = node.get("subtitle")
+            if isinstance(sub, str) and sub.strip():
+                return sub.strip()
+        for valor in node.values():
+            r = _buscar_venue(valor)
+            if r:
+                return r
+    elif isinstance(node, list):
+        for item in node:
+            r = _buscar_venue(item)
+            if r:
+                return r
+    return None
+
+
+def obtener_partidos() -> list:
+    """Scrapea el listado completo de Primera A desde onefootball.com.
+
+    Devuelve list[dict] con las claves canónicas del pipeline:
+    Fecha, Hora, Equipo Local, Equipo Visitante, Estadio, Jornada.
+    También incluye _url_detalle (consumida y eliminada por enriquecer_con_estadio).
+    """
+    headers = {
+        "User-Agent":      USER_AGENT,
+        "Accept-Language": "es-CO,es;q=0.9",
+    }
+    try:
+        r = requests.get(URL_ONEFOOTBALL, headers=headers, timeout=15)
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error obteniendo partidos de onefootball: {e}")
+        return []
+
+    payload = _extraer_next_data(r.text)
+    if payload is None:
+        return []
+
+    raw_matches = _buscar_lista_partidos(payload)
+    if not raw_matches:
+        print("❌ No se encontró la lista de partidos en el JSON de onefootball.")
+        return []
+
+    tz = ZoneInfo(ZONA_HORARIA)
+    partidos = []
+    for m in raw_matches:
+        kickoff = m.get("kickoff") or m.get("kickoffTime") or m.get("scheduledAt")
+        if not kickoff:
+            continue
+        try:
+            dt_local = datetime.fromisoformat(
+                kickoff.replace("Z", "+00:00")
+            ).astimezone(tz)
+        except (ValueError, AttributeError):
+            continue
+        partidos.append({
+            "Fecha":            dt_local.strftime("%d/%m/%Y"),
+            "Hora":             dt_local.strftime("%H:%M"),
+            "Equipo Local":     ((m.get("homeTeam") or {}).get("name") or "").strip(),
+            "Equipo Visitante": ((m.get("awayTeam") or {}).get("name") or "").strip(),
+            "Estadio":          "N/D",
+            "Jornada":          str(m.get("matchday") or m.get("round") or "N/D"),
+            "_url_detalle":     m.get("url") or m.get("detailUrl") or m.get("link") or "",
+        })
+    return partidos
+
+
+def _scrapear_estadio(partido: dict) -> None:
+    """Worker: scrapea la página de detalle de un partido y actualiza Estadio in-place.
+
+    Diseñado para correr en paralelo desde un ThreadPoolExecutor.
+    Fallos individuales se ignoran (el partido conserva 'N/D').
+    """
+    url = partido.pop("_url_detalle", "")
+    if not url:
+        return
+    if url.startswith("/"):
+        url = "https://onefootball.com" + url
+    headers = {
+        "User-Agent":      USER_AGENT,
+        "Accept-Language": "es-CO,es;q=0.9",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+    except requests.exceptions.RequestException:
+        return
+    payload = _extraer_next_data(r.text)
+    if not payload:
+        return
+    venue = _buscar_venue(payload)
+    if venue:
+        partido["Estadio"] = venue
+
+
+def enriquecer_con_estadio(partidos: list) -> None:
+    """Enriquece in-place cada partido con el estadio desde su página de detalle.
+
+    Las peticiones se hacen en paralelo (un thread por partido, hasta 8) porque
+    son IO-bound: en Cloud Run Jobs esto baja una latencia de ~7s a ~2s para
+    una jornada típica de 5 partidos.
+    """
+    if not partidos:
+        return
+    workers = min(8, len(partidos))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_scrapear_estadio, partidos))
 
 
 # ─────────────────────────────────────────────
@@ -158,63 +338,38 @@ def leer_suscriptores(filas: list) -> list:
 # GENERAR CUERPO DEL CORREO (HTML)
 # ─────────────────────────────────────────────
 def generar_html(partidos_usuario: list) -> str:
-    hoy_str = HOY.strftime("%d/%m/%Y")
-    filas_html = ""
+    fuente   = "-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,Roboto,sans-serif"
+    titulo   = f"Primera A · {HOY.day} de {MESES_ES[HOY.month]}"
+
+    bloques = ""
     for p in partidos_usuario:
-        local     = p.get("Equipo Local",     "N/D")
-        visitante = p.get("Equipo Visitante", "N/D")
-        hora      = p.get("Hora",             "N/D")
-        estadio   = p.get("Estadio",          "N/D")
-        jornada   = p.get("Jornada",          "N/D")
-        filas_html += f"""
-        <tr>
-          <td style="padding:12px 16px;font-weight:600;color:#1a1a1a">{local}</td>
-          <td style="padding:12px 8px;text-align:center;color:#666;font-size:13px">vs</td>
-          <td style="padding:12px 16px;font-weight:600;color:#1a1a1a">{visitante}</td>
-          <td style="padding:12px 16px;color:#444;font-size:13px">{hora}</td>
-          <td style="padding:12px 16px;color:#444;font-size:13px">{estadio}</td>
-          <td style="padding:12px 16px;color:#888;font-size:12px">J{jornada}</td>
-        </tr>"""
+        local     = p.get("Equipo Local",     "")
+        visitante = p.get("Equipo Visitante", "")
+        hora      = p.get("Hora",             "")
+        estadio   = p.get("Estadio",          "")
+        meta      = " · ".join(x for x in (hora, estadio) if x and x != "N/D")
+        bloques += f"""
+              <tr><td style="padding:20px 0;border-top:1px solid #e5e7eb">
+                <div style="font-size:16px;font-weight:600;color:#0f172a;line-height:1.4">
+                  {local} <span style="color:#94a3b8;font-weight:400">vs</span> {visitante}
+                </div>
+                <div style="font-size:13px;color:#64748b;margin-top:4px">{meta}</div>
+              </td></tr>"""
 
     return f"""<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"></head>
-<body style="font-family:Arial,sans-serif;background:#f5f5f5;padding:24px;margin:0">
-  <div style="max-width:640px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08)">
-    <!-- Header -->
-    <div style="background:#1B5E20;padding:28px 32px">
-      <h1 style="color:#fff;margin:0;font-size:22px;font-weight:700">⚽ Primera A Colombia</h1>
-      <p style="color:#A5D6A7;margin:6px 0 0;font-size:14px">Partidos de hoy · {hoy_str}</p>
-    </div>
-    <!-- Tabla de partidos -->
-    <div style="padding:24px 32px">
-      <p style="color:#333;font-size:15px;margin:0 0 20px">
-        Hoy juegan los equipos que sigues:
-      </p>
-      <table style="width:100%;border-collapse:collapse;font-size:14px">
-        <thead>
-          <tr style="background:#F1F8E9;border-bottom:2px solid #C8E6C9">
-            <th style="padding:10px 16px;text-align:left;color:#2E7D32;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Local</th>
-            <th style="padding:10px 8px"></th>
-            <th style="padding:10px 16px;text-align:left;color:#2E7D32;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Visitante</th>
-            <th style="padding:10px 16px;text-align:left;color:#2E7D32;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Hora</th>
-            <th style="padding:10px 16px;text-align:left;color:#2E7D32;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Estadio</th>
-            <th style="padding:10px 16px;text-align:left;color:#2E7D32;font-size:12px;text-transform:uppercase;letter-spacing:.5px">Jornada</th>
-          </tr>
-        </thead>
-        <tbody>
-          {filas_html}
-        </tbody>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#ffffff;font-family:{fuente};color:#0f172a">
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#ffffff">
+    <tr><td align="center" style="padding:48px 24px">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="max-width:520px">
+        <tr><td style="padding-bottom:32px">
+          <div style="font-size:13px;color:#64748b;letter-spacing:.02em">{titulo}</div>
+        </td></tr>
+        {bloques}
       </table>
-    </div>
-    <!-- Footer -->
-    <div style="padding:20px 32px;background:#FAFAFA;border-top:1px solid #eee">
-      <p style="color:#999;font-size:12px;margin:0">
-        Notificación automática · Primera A Colombia 2026<br>
-        Para cancelar tu suscripción, responde este correo con "cancelar".
-      </p>
-    </div>
-  </div>
+    </td></tr>
+  </table>
 </body>
 </html>"""
 
@@ -224,13 +379,11 @@ def generar_html(partidos_usuario: list) -> str:
 # ─────────────────────────────────────────────
 def enviar_correo(destinatario: str, partidos_usuario: list) -> bool:
     hoy_str = HOY.strftime("%d/%m/%Y")
-    nombres = " y ".join(
-        set(p.get("Equipo Local", "") + " / " + p.get("Equipo Visitante", "")
-            for p in partidos_usuario)
-    )
+    n       = len(partidos_usuario)
+    plural  = "partido" if n == 1 else "partidos"
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"⚽ Tus equipos juegan hoy {hoy_str} — Primera A"
+    msg["Subject"] = f"Primera A · {hoy_str} · {n} {plural} hoy"
     msg["From"]    = f"Primera A Notificaciones <{GMAIL_USER}>"
     msg["To"]      = destinatario
 
@@ -263,8 +416,8 @@ def main():
     print(f"{'═'*52}\n")
 
     # 1. Cargar datos
-    print("1️⃣  Cargando partidos...")
-    filas_partidos = leer_sheet(SHEET_PARTIDOS_ID, SHEET_PARTIDOS_NAME)
+    print("1️⃣  Cargando partidos desde onefootball...")
+    filas_partidos = obtener_partidos()
     if not filas_partidos:
         print("   Sin datos de partidos. Abortando.")
         return
@@ -283,6 +436,8 @@ def main():
         print("ℹ️  No hay partidos hoy. No se envían notificaciones.\n")
         return
 
+    print("   Obteniendo estadios desde páginas de detalle...")
+    enriquecer_con_estadio(partidos_hoy)
     indice_equipos = construir_indice(partidos_hoy)
 
     # 3. Procesar suscriptores
